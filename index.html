@@ -2216,8 +2216,8 @@
                   —
                 </div>
 
-                <div class="stat-note">
-                  Recently active
+                <div class="stat-note" id="activeTodayNote" aria-live="polite">
+                  Checking today's activity (WAT)…
                 </div>
 
               </div>
@@ -4453,6 +4453,7 @@
 
       verificationVisibleLimit = VERIFICATION_RENDER_LIMIT;
       renderVerificationTable();
+      void resolveVerificationProfiles();
       verificationHasRendered = true;
       return verificationRequests.length > 0;
     }
@@ -5080,21 +5081,68 @@
         .textContent =
         (totalUsersOnServer ?? allUsers.length).toLocaleString();
 
-      const activeToday =
-        allUsers.filter(
-          (user) =>
-            isToday(
-              getLastActive(user)
-            )
-        ).length;
-
-
-      $("statActiveToday")
-        .textContent =
-        activeToday.toLocaleString();
+      // Active Today is counted across Firestore, NOT the currently loaded
+      // users page. refreshActiveToday() manages this value independently.
 
     }
 
+
+    // Nigeria-local calendar day (West Africa Time / UTC+01:00).
+    // Firestore aggregation handles large user bases without downloading profiles.
+    let activeTodayCount = null;
+    let activeTodayRequest = 0;
+
+    function activeTodayRange() {
+      const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Africa/Lagos', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(new Date());
+      const part = type => Number(parts.find(item => item.type === type)?.value);
+      const year = part('year'), month = part('month'), day = part('day');
+      // Africa/Lagos is UTC+01:00, with no daylight saving time.
+      const start = new Date(Date.UTC(year, month - 1, day) - 60 * 60 * 1000);
+      const end = new Date(Date.UTC(year, month - 1, day + 1) - 60 * 60 * 1000);
+      return { start, end, label: `${String(day).padStart(2,'0')}/${String(month).padStart(2,'0')}/${year}` };
+    }
+
+    async function refreshActiveToday() {
+      const requestId = ++activeTodayRequest;
+      const value = $('statActiveToday');
+      const note = $('activeTodayNote');
+      if (!value || !note) return;
+      const { start, end, label } = activeTodayRange();
+      if (activeTodayCount === null) value.textContent = '…';
+      note.textContent = `Checking activity · ${label} (WAT)…`;
+      // Existing Masoya profiles have used several activity-field names.
+      // Count each supported field separately without downloading user documents.
+      // Do not add these counts: one user can have multiple activity fields.
+      const fields = ['lastActive', 'lastActiveAt', 'lastSeen'];
+      const results = await Promise.allSettled(fields.map(async field => {
+        const count = await getCountFromServer(query(
+          collection(db, 'users'),
+          where(field, '>=', Timestamp.fromDate(start)),
+          where(field, '<', Timestamp.fromDate(end))
+        ));
+        return { field, count: count.data().count };
+      }));
+      if (requestId !== activeTodayRequest) return;
+      const successful = results.filter(r => r.status === 'fulfilled').map(r => r.value);
+      if (successful.length) {
+        // The maximum avoids double-counting users across overlapping fields.
+        // A unified app-written activity timestamp is needed for exact cross-field totals.
+        const highest = successful.reduce((a,b) => b.count > a.count ? b : a);
+        activeTodayCount = highest.count;
+        value.textContent = highest.count.toLocaleString();
+        const partial = successful.length !== fields.length;
+        note.textContent = `${label} (WAT) · ${highest.field}${partial ? ' · Partial data' : ''} · Updated ${new Date().toLocaleTimeString('en-NG',{timeZone:'Africa/Lagos',hour:'2-digit',minute:'2-digit'})}`;
+        value.title = `Server count using ${highest.field}. Users on other activity fields are not merged, to avoid counting one user twice.`;
+      } else {
+        console.error('Active Today queries failed:', results.map(r=>r.reason));
+        const visible = allUsers.filter(user => isToday(getLastActive(user))).length;
+        value.textContent = visible.toLocaleString();
+        note.textContent = `Active in loaded users (${allUsers.length}) · ${label} · Partial count`;
+        value.title = 'Server count unavailable; showing only active users from loaded profiles.';
+      }
+    }
 
     /* ==========================================================
        REPORTS
@@ -6520,30 +6568,57 @@
     }
 
 
-    function getVerificationUser(request) {
-      const uid =
-        request?.uid ||
-        request?.id;
-
-      return (
-        allUsers.find(
-          (item) =>
-            item.uid === uid
-        ) || {
-          uid,
-          fullName:
-            request?.name ||
-            "Unknown User",
-          name:
-            request?.name ||
-            "Unknown User",
-          photoUrl:
-            request?.photoUrl ||
-            ""
-        }
-      );
+    // Look up verification applicants independently of the paginated Users page.
+    const verificationProfileCache = new Map();
+    const verificationProfilePending = new Set();
+    function verificationUid(request) {
+      return String(request?.uid || request?.userId || request?.userUid ||
+        request?.ownerUid || request?.applicantUid || request?.id || '').trim();
     }
-
+    function getVerificationUser(request) {
+      const uid = verificationUid(request);
+      return allUsers.find(user => user.uid === uid) ||
+        verificationProfileCache.get(uid) || {
+          uid,
+          fullName: request?.fullName || request?.userName || request?.displayName ||
+            request?.name || (verificationProfilePending.has(uid) ? 'Loading profile…' : 'User profile unavailable'),
+          email: request?.email || request?.userEmail || '',
+          photoUrl: request?.photoUrl || request?.profilePhotoUrl || ''
+        };
+    }
+    async function resolveVerificationProfiles(requests = verificationRequests) {
+      const uids = [...new Set(requests.map(verificationUid).filter(Boolean))]
+        .filter(uid => !allUsers.some(u => u.uid === uid) &&
+          !verificationProfileCache.has(uid) && !verificationProfilePending.has(uid))
+        .slice(0, VERIFICATION_QUERY_LIMIT);
+      // Limit simultaneous reads; update only the affected card header, never its video.
+      for (let i=0; i<uids.length; i+=6) {
+        await Promise.all(uids.slice(i,i+6).map(async uid => {
+          verificationProfilePending.add(uid);
+          try {
+            const snap = await getDoc(doc(db,'users',uid));
+            verificationProfileCache.set(uid, snap.exists()
+              ? { ...snap.data(), uid }
+              : { uid, name:'Deleted / unavailable account' });
+          } catch (error) {
+            console.warn('Verification profile lookup failed:',uid,error);
+          } finally {
+            verificationProfilePending.delete(uid);
+          }
+          const request = verificationRequests.find(r => verificationUid(r) === uid);
+          const card = request && $('verification-card-' + request.id);
+          if (card && request) {
+            const header = card.querySelector('.verification-user-info');
+            if (header) header.innerHTML = userCellHtml(getVerificationUser(request));
+            const badges = card.querySelector('.verification-card-meta');
+            if (badges) {
+              const user = getVerificationUser(request);
+              badges.innerHTML = `${accountBadge(user)}${verifiedBadge(user)}<span class="badge badge-pending">Pending</span>`;
+            }
+          }
+        }));
+      }
+    }
 
     function getVerificationProfilePhoto(request) {
       const user =
@@ -7071,6 +7146,7 @@
       renderVerificationLoadMoreFooter();
       verificationHasRendered = true;
       scheduleVerificationVideoPrefetch();
+      void resolveVerificationProfiles(pending);
     }
 
 
@@ -7098,6 +7174,7 @@
 
       verificationRequests =
         normalizedNext;
+      void resolveVerificationProfiles(normalizedNext);
 
       if (
         !verificationHasRendered ||
@@ -7609,13 +7686,13 @@
 
         if (
           decision === "approved" &&
-          request.uid
+          verificationUid(request)
         ) {
           const userRef =
             doc(
               db,
               "users",
-              request.uid
+              verificationUid(request)
             );
 
           batch.set(
@@ -7650,10 +7727,10 @@
           try {
             if (
               decision === "approved" &&
-              request.uid
+              verificationUid(request)
             ) {
               updateLocalUser(
-                request.uid,
+                verificationUid(request),
                 {
                   isVerified: true
                 }
@@ -8714,9 +8791,8 @@
     async function refreshDashboard() {
 
       updateUserStats();
-
       updateReportStats();
-
+      const activeTodayPromise = refreshActiveToday();
 
       try {
 
@@ -8735,6 +8811,7 @@
           "—";
 
       }
+      await activeTodayPromise;
 
     }
 
