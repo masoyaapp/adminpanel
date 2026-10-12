@@ -3548,6 +3548,20 @@
     let currentUserFilter = "all";
 
     let currentUserSearch = "";
+    let fullSearchResults = null;
+    let fullSearchBusy = false;
+    let fullSearchToken = 0;
+    const MAX_SEARCH_RESULTS = 500;
+    const MAX_SEARCH_SCANNED = 30000;
+    const recentActivityFields = ['lastActive', 'lastActiveAt', 'lastSeen', 'updatedAt'];
+    const activityTime = user => toDate(getLastActive(user))?.getTime() || 0;
+    const newestFirst = (a,b) => activityTime(b) - activityTime(a) || String(a.uid||'').localeCompare(String(b.uid||''));
+    function matchesUserSearch(user, search) {
+      return [getUserName(user),getUserEmail(user),user.uid,user.gender,
+        getUserLocation(user),user.city,user.state,user.country]
+        .some(v => String(v || '').toLowerCase().includes(search));
+    }
+
 
     let currentReportSearch = "";
 
@@ -4491,6 +4505,12 @@
         const version = ++usersLoadVersion;
         const snapshot = await getDocs(query(collection(db, "users"),
           orderBy(documentId()), limit(PAGE_SIZE)));
+        // Fetch the most recent profiles across legacy presence field names.
+        // Each indexed query is bounded, avoiding loading the full user base.
+        const recentSnapshots = await Promise.all(recentActivityFields.map(field =>
+          getDocs(query(collection(db, 'users'), orderBy(field, 'desc'), limit(PAGE_SIZE)))
+            .catch(err => { console.warn('Recent activity query:', field, err); return null; })
+        ));
         if (version !== usersLoadVersion) return;
         usersCursor = snapshot.docs[snapshot.docs.length - 1] || null;
         usersHasMore = snapshot.size === PAGE_SIZE;
@@ -4513,6 +4533,13 @@
         );
 
 
+        const recentById = new Map(allUsers.map(user => [user.uid, user]));
+        for (const recentSnap of recentSnapshots) {
+          if (!recentSnap) continue;
+          for (const d of recentSnap.docs) recentById.set(d.id, {...d.data(), uid:d.id});
+        }
+        allUsers = [...recentById.values()].sort(newestFirst);
+        fullSearchResults = null;
         saveUsersCache();
         writeCache("users", allUsers.slice(0, PAGE_SIZE).map(compactUserForCache));
         updateLoadMore('users');
@@ -4583,7 +4610,7 @@
     function applyUserFilters() {
 
       let result =
-        [...allUsers];
+        [...(currentUserSearch && fullSearchResults !== null ? fullSearchResults : allUsers)];
 
 
       /* SEARCH */
@@ -4661,8 +4688,7 @@
       }
 
 
-      filteredUsers =
-        result;
+      filteredUsers = result.sort(newestFirst).slice(0, currentUserSearch ? MAX_SEARCH_RESULTS : 500);
 
       renderUsersTable();
 
@@ -4730,7 +4756,7 @@
 
 
       tbody.innerHTML =
-        sorted.slice(0, 80)
+        sorted.slice(0, 500)
           .map(
             (user) => {
 
@@ -5017,10 +5043,10 @@
         "input",
         (event) => {
 
-          currentUserSearch =
-            event.target.value
-              .trim();
-
+          currentUserSearch = event.target.value.trim();
+          fullSearchToken++;
+          fullSearchResults = null;
+          if (typeof fullSearchNote !== 'undefined') fullSearchNote.textContent = 'Search all users for up to 500 matches, newest activity first.';
           applyUserFilters();
 
         }
@@ -9315,6 +9341,7 @@
           usersHasMore = snap.size === PAGE_SIZE;
           const known = new Set(allUsers.map(x => x.uid));
           for (const d of snap.docs) if (!known.has(d.id)) allUsers.push({...d.data(),uid:d.id});
+          allUsers.sort(newestFirst);
           applyUserFilters(); renderRecentUsers(); updateUserStats();
         } else {
           reportsCursor = snap.docs[snap.docs.length - 1] || reportsCursor;
@@ -9441,6 +9468,66 @@
         try{await updateDoc(doc(db,'support_tickets',id),{unreadForSupport:false});t.unreadForSupport=false;renderSupportInbox();}catch(e){showToast('Unable to mark ticket read: '+e.message,'warning');}
       }
     }
+    // Full-text substring search: Firestore cannot index arbitrary contains queries.
+    // Scan in bounded batches only when explicitly requested, then rank matching
+    // users globally by latest activity. Do not write fetched profiles into the
+    // regular paginated users list or alter Firestore data.
+    const searchAllButton = document.createElement('button');
+    searchAllButton.className = 'btn btn-primary';
+    searchAllButton.type = 'button';
+    searchAllButton.innerHTML = '<i class="fa-solid fa-magnifying-glass"></i> Search all users';
+    const searchInput = $('userSearch');
+    const searchBox = searchInput?.closest('.search-box');
+    if (searchBox) searchBox.after(searchAllButton);
+    const fullSearchNote = document.createElement('span');
+    fullSearchNote.style.cssText = 'font-size:11px;color:var(--muted);flex-basis:100%';
+    fullSearchNote.textContent = 'Search all users for up to 500 matches, newest activity first.';
+    if (searchBox) searchBox.parentNode.append(fullSearchNote);
+    async function runFullUserSearch() {
+      const term = (searchInput?.value || '').trim().toLowerCase();
+      if (!term) { showToast('Enter a name, email, UID, gender or location.','warning'); return; }
+      if (fullSearchBusy) return;
+      fullSearchBusy = true;
+      const token = ++fullSearchToken;
+      searchAllButton.disabled = true;
+      const found = new Map();
+      let cursor = null, scanned = 0, complete = false;
+      try {
+        while (scanned < MAX_SEARCH_SCANNED && token === fullSearchToken) {
+          const batchSize = Math.min(250, MAX_SEARCH_SCANNED - scanned);
+          const parts = [collection(db,'users'),orderBy(documentId())];
+          if (cursor) parts.push(startAfter(cursor));
+          parts.push(limit(batchSize));
+          const snap = await getDocs(query(...parts));
+          if (token !== fullSearchToken) return;
+          scanned += snap.size;
+          for (const d of snap.docs) {
+            const u={...d.data(),uid:d.id};
+            if (matchesUserSearch(u,term)) found.set(d.id,u);
+          }
+          fullSearchNote.textContent = `Searching… ${scanned.toLocaleString()} profiles checked, ${found.size.toLocaleString()} matches`;
+          if (snap.size < batchSize) { complete = true; break; }
+          cursor = snap.docs[snap.docs.length-1];
+          // Give the browser an opportunity to render between large result batches.
+          await new Promise(resolve => setTimeout(resolve,0));
+        }
+        if (token !== fullSearchToken) return;
+        fullSearchResults = [...found.values()].sort(newestFirst).slice(0,MAX_SEARCH_RESULTS);
+        currentUserSearch = searchInput.value.trim();
+        applyUserFilters();
+        const suffix = complete ? 'Entire user collection checked.' : 'Search scan limit reached; results may be incomplete.';
+        fullSearchNote.textContent = `${found.size.toLocaleString()} matches; showing ${fullSearchResults.length.toLocaleString()} newest. ${suffix}`;
+      } catch(err) {
+        console.error('Full user search:',err);
+        fullSearchNote.textContent = `Search failed after ${scanned.toLocaleString()} profiles. Retry search.`;
+        showToast('Search failed: '+err.message,'error');
+      } finally { fullSearchBusy=false; searchAllButton.disabled=false; }
+    }
+    searchAllButton.addEventListener('click',runFullUserSearch);
+    searchInput?.addEventListener('keydown',event=>{
+      if(event.key==='Enter'){event.preventDefault();runFullUserSearch();}
+    });
+
     // Direct server lookup lets admins find accounts beyond the currently loaded page.
     const directSearchButton = document.createElement('button');
     directSearchButton.className = 'btn btn-outline';
